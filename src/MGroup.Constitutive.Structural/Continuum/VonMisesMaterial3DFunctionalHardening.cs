@@ -18,14 +18,13 @@ namespace MGroup.Constitutive.Structural.Continuum
 	///   Class for 3D Von Mises materials.
 	/// </summary>
 	/// <a href = "http://en.wikipedia.org/wiki/Von_Mises_yield_criterion">Wikipedia -Von Mises yield criterion</a>
-	public class VonMisesMaterial3D : IIsotropicContinuumMaterial3D
+	public class VonMisesMaterial3DFunctionalHardening : IIsotropicContinuumMaterial3D
 	{
 		/// <summary>
 		///   Identity second order tensor written in vector form.
 		/// </summary>
 		private static readonly double[] IdentityVector = new[] { 1.0, 1.0, 1.0, 0, 0, 0 };
 		private const string EQUIVALENT_PLASTIC_STRAIN = "Equivalent plastic strain";
-		private const string YIELD_STRESS = "Yield stress";
 		private const string STRESS_X = "Stress X";
 		private const string STRESS_Y = "Stress Y";
 		private const string STRESS_Z = "Stress Z";
@@ -83,7 +82,14 @@ namespace MGroup.Constitutive.Structural.Continuum
 		/// <summary>
 		///   Hardening modulus for linear hardening.
 		/// </summary>
-		private readonly double hardeningRatio;
+		private readonly Func<double, double> hardeningFunc;
+
+		private double hardeningGrad;
+
+		/// <summary>
+		///   Hardening modulus for linear hardening.
+		/// </summary>
+		private double hardeningModulus;
 
 		/// <summary>
 		///   The Poisson ratio.
@@ -110,22 +116,13 @@ namespace MGroup.Constitutive.Structural.Continuum
 		private readonly double bulkModulus;
 
 		/// <summary>
-		///   The initial yield stress.
+		///   The yields stress.
 		/// </summary>
 		/// <remarks>
 		///   <a href = "http://en.wikipedia.org/wiki/Yield_%28engineering%29">Yield (engineering)</a>
 		///   The yield strength or yield point of a material is defined in engineering and materials science as the stress at which a material begins to deform plastically.
 		/// </remarks>
-		private readonly double initialYieldStress;
-
-		/// <summary>
-		///   The current yield stress.
-		/// </summary>
-		/// <remarks>
-		///   <a href = "http://en.wikipedia.org/wiki/Yield_%28engineering%29">Yield (engineering)</a>
-		///   The yield strength or yield point of a material is defined in engineering and materials science as the stress at which a material begins to deform plastically.
-		/// </remarks>
-		private double yieldStress;
+		private readonly double yieldStress;
 
 		/// <summary>
 		///   The young modulus.
@@ -212,11 +209,11 @@ namespace MGroup.Constitutive.Structural.Continuum
 		/// <param name = "yieldStress">
 		///   The yield stress.
 		/// </param>
-		/// <param name = "hardeningRatio">
-		///   The hardening ratio.
+		/// <param name = "hardeningFunc">
+		///   The hardening function.
 		/// </param>
 		/// <exception cref = "ArgumentException"> When Poisson ratio is equal to 0.5.</exception>
-		public VonMisesMaterial3D(double youngModulus, double poissonRatio, double yieldStress, double hardeningRatio)
+		public VonMisesMaterial3DFunctionalHardening(double youngModulus, double poissonRatio, double yieldStress, Func<double, double> hardeningFunc)
 		{
 			this.youngModulus = youngModulus;
 
@@ -227,8 +224,8 @@ namespace MGroup.Constitutive.Structural.Continuum
 			}
 
 			this.poissonRatio = poissonRatio;
-			this.initialYieldStress = yieldStress;
-			this.hardeningRatio = hardeningRatio;
+			this.yieldStress = yieldStress;
+			this.hardeningFunc = hardeningFunc;
 
 			this.shearModulus = this.YoungModulus / (2 * (1 + this.PoissonRatio));
 			this.bulkModulus = this.YoungModulus / (3 * (1 - 2 * this.PoissonRatio));
@@ -355,7 +352,7 @@ namespace MGroup.Constitutive.Structural.Continuum
 		/// </returns>
 		public object Clone()
 		{
-			return new VonMisesMaterial3D(this.youngModulus, this.poissonRatio, this.initialYieldStress, this.hardeningRatio)
+			return new VonMisesMaterial3DFunctionalHardening(this.youngModulus, this.poissonRatio, this.yieldStress, this.hardeningFunc)
 			{
 				modified = this.IsCurrentStateDifferent(),
 				strainsEquivalent = this.strainsEquivalent,
@@ -403,7 +400,6 @@ namespace MGroup.Constitutive.Structural.Continuum
 			currentState = new GenericConstitutiveLawState(this, new[]
 			{
 				(EQUIVALENT_PLASTIC_STRAIN, strainsEquivalent),
-				(YIELD_STRESS, yieldStress),
 				(STRESS_X, stresses[0]),
 				(STRESS_Y, stresses[1]),
 				(STRESS_Z, stresses[2]),
@@ -422,7 +418,6 @@ namespace MGroup.Constitutive.Structural.Continuum
 			{
 				currentState = value;
 				strainsEquivalent = currentState.StateValues[EQUIVALENT_PLASTIC_STRAIN];
-				yieldStress = currentState.StateValues[YIELD_STRESS];
 				stresses[0] = currentState.StateValues[STRESS_X];
 				stresses[1] = currentState.StateValues[STRESS_Y];
 				stresses[2] = currentState.StateValues[STRESS_Z];
@@ -452,7 +447,6 @@ namespace MGroup.Constitutive.Structural.Continuum
 			currentState = new GenericConstitutiveLawState(this, new[]
 {
 				(EQUIVALENT_PLASTIC_STRAIN, strainsEquivalent),
-				(YIELD_STRESS, yieldStress),
 				(STRESS_X, stresses[0]),
 				(STRESS_Y, stresses[1]),
 				(STRESS_Z, stresses[2]),
@@ -464,30 +458,30 @@ namespace MGroup.Constitutive.Structural.Continuum
 			return stressesNew;
 		}
 
-		/// <summary>
-		///   Builds the consistent tangential constitutive matrix.
-		/// </summary>
-		/// <param name = "value1"> This is a constant already calculated in the calling method. </param>
-		/// <remarks>
-		///   Refer to chapter 7.6.6 page 262 in Souza Neto. 
-		/// </remarks>
-		private Matrix BuildConsistentTangentialConstitutiveMatrix(double vonMisesStress, double[] unityvector)
-		{
-			Matrix consistenttangent = Matrix.CreateZero(TotalStresses, TotalStrains);
-			double dgamma = this.strainsEquivalent - this.strainsEquivalentPrev;
-			double v1 = -dgamma * 6 * Math.Pow(this.shearModulus, 2) / vonMisesStress;
-			double Hk = 0;
-			double Hi = this.hardeningRatio;
-			double v2 = (dgamma / vonMisesStress - 1 / (3 * this.shearModulus + Hk + Hi)) * 6 * Math.Pow(this.shearModulus, 2);
-			for (int i = 0; i < 6; i++)
-			{
-				for (int j = 0; j < 6; j++)
-				{
-					consistenttangent[i, j] = this.elasticConstitutiveMatrix[i, j] + v1 * DeviatoricProjection[i, j] + v2 * unityvector[i] * unityvector[j];
-				}
-			}
-			return consistenttangent;
-		}
+		///// <summary>
+		/////   Builds the consistent tangential constitutive matrix.
+		///// </summary>
+		///// <param name = "value1"> This is a constant already calculated in the calling method. </param>
+		///// <remarks>
+		/////   Refer to chapter 7.6.6 page 262 in Souza Neto. 
+		///// </remarks>
+		//private Matrix BuildConsistentTangentialConstitutiveMatrix(double vonMisesStress, double[] unityvector)
+		//{
+		//	Matrix consistenttangent = Matrix.CreateZero(TotalStresses, TotalStrains);
+		//	double dgamma = this.strainsEquivalent - this.strainsEquivalentPrev;
+		//	double v1 = -dgamma * 6 * Math.Pow(this.shearModulus, 2) / vonMisesStress;
+		//	double Hk = 0;
+		//	double Hi = this.hardeningRatio;
+		//	double v2 = (dgamma / vonMisesStress - 1 / (3 * this.shearModulus + Hk + Hi)) * 6 * Math.Pow(this.shearModulus, 2);
+		//	for (int i = 0; i < 6; i++)
+		//	{
+		//		for (int j = 0; j < 6; j++)
+		//		{
+		//			consistenttangent[i, j] = this.elasticConstitutiveMatrix[i, j] + v1 * DeviatoricProjection[i, j] + v2 * unityvector[i] * unityvector[j];
+		//		}
+		//	}
+		//	return consistenttangent;
+		//}
 
 		/// <summary>
 		///   Builds the consistent tangential constitutive matrix.
@@ -495,7 +489,7 @@ namespace MGroup.Constitutive.Structural.Continuum
 		/// <remarks>
 		///   Refer to chapter 7.6.6 page 262 in Souza Neto. 
 		/// </remarks>
-		private void BuildConsistentTangentialConstitutiveMatrix(double[] strainDeviatoricTrial, double normStrainDeviatoricTrial, double deltastrainsEquivalent, double vonMisesStress)
+		private void BuildConsistentTangentialConstitutiveMatrix(double[] strainDeviatoricTrial, double normStrainDeviatoricTrial, double vonMisesStress, double deltastrainsEquivalent)
 		{
 			var N = new double[incrementalStrains.Length];
 			for (int i = 0; i < incrementalStrains.Length; i++)
@@ -506,33 +500,33 @@ namespace MGroup.Constitutive.Structural.Continuum
 			{
 				for (int j = 0; j < incrementalStrains.Length; j++)
 				{
-					constitutiveMatrix[i, j] = 2 * shearModulus * (1 - (3 * shearModulus * deltastrainsEquivalent) / vonMisesStress) * DeviatoricProjection[i, j] +
-						6 * shearModulus * shearModulus * (deltastrainsEquivalent / vonMisesStress - 1 / (3 * shearModulus + hardeningRatio)) * (N[i] * N[j]) + bulkModulus * VolumetricProjection[i, j];
+					constitutiveMatrix[i, j] = 2 * shearModulus * (1 - (3 * shearModulus * vonMisesStress) / deltastrainsEquivalent) * DeviatoricProjection[i, j] +
+						6 * shearModulus * shearModulus * (vonMisesStress / deltastrainsEquivalent - 1 / (3 * shearModulus + hardeningModulus)) * (N[i] * N[j]) + bulkModulus * VolumetricProjection[i, j];
 				}
 			}
 		}
 
-		/// <summary>
-		///   Builds the tangential constitutive matrix.
-		/// </summary>
-		private void BuildTangentialConstitutiveMatrix()
-		{
-			this.constitutiveMatrix = Matrix.CreateZero(TotalStresses, TotalStrains);
-			double invariantJ2New = this.GetDeviatorSecondStressInvariant(stressesNew);
+		///// <summary>
+		/////   Builds the tangential constitutive matrix.
+		///// </summary>
+		//private void BuildTangentialConstitutiveMatrix()
+		//{
+		//	this.constitutiveMatrix = Matrix.CreateZero(TotalStresses, TotalStrains);
+		//	double invariantJ2New = this.GetDeviatorSecondStressInvariant(stressesNew);
 
-			double value2 = (3 * this.shearModulus * this.shearModulus) /
-							((this.hardeningRatio + (3 * this.shearModulus)) * invariantJ2New);
+		//	double value2 = (3 * this.shearModulus * this.shearModulus) /
+		//					((this.hardeningRatio + (3 * this.shearModulus)) * invariantJ2New);
 
-			var stressDeviator = this.GetStressDeviator(stressesNew);
-			for (int k1 = 0; k1 < TotalStresses; k1++)
-			{
-				for (int k2 = 0; k2 < TotalStresses; k2++)
-				{
-					this.constitutiveMatrix[k2, k1] = this.elasticConstitutiveMatrix[k2, k1] -
-													  (value2 * stressDeviator[k2] * stressDeviator[k1]);
-				}
-			}
-		}
+		//	var stressDeviator = this.GetStressDeviator(stressesNew);
+		//	for (int k1 = 0; k1 < TotalStresses; k1++)
+		//	{
+		//		for (int k2 = 0; k2 < TotalStresses; k2++)
+		//		{
+		//			this.constitutiveMatrix[k2, k1] = this.elasticConstitutiveMatrix[k2, k1] -
+		//											  (value2 * stressDeviator[k2] * stressDeviator[k1]);
+		//		}
+		//	}
+		//}
 
 		/// <summary>
 		///   Calculates the next stress-strain point.
@@ -572,14 +566,12 @@ namespace MGroup.Constitutive.Structural.Continuum
 			normStrainDeviatoricTrial = Math.Sqrt(normStrainDeviatoricTrial);
 			var J2 = GetDeviatorSecondStressInvariant(stressTrial);
 			double vonMisesStress = Math.Sqrt(3 * J2);
-			double vonMisesStressMinusYieldStress = vonMisesStress -
-													(this.initialYieldStress + (this.hardeningRatio * this.strainsEquivalentPrev));
+			double vonMisesStressMinusYieldStress = vonMisesStress - hardeningFunc(strainsEquivalentPrev);
 
-			yieldStress = this.initialYieldStress + (this.hardeningRatio * this.strainsEquivalentPrev);
 			bool materialIsInElasticRegion = vonMisesStressMinusYieldStress <= 0;
 			var stressVolumetric = new double[incrementalStrains.Length];
 			var stressDeviatoric = new double[incrementalStrains.Length];
-
+			double deltastrainsEquivalent = 0;
 			if (materialIsInElasticRegion)
 			{
 				stressesNew.CopyFrom(stressTrial);
@@ -590,9 +582,16 @@ namespace MGroup.Constitutive.Structural.Continuum
 			}
 			else
 			{
-				double deltastrainsEquivalent = vonMisesStressMinusYieldStress /
-											((3 * this.shearModulus) + this.hardeningRatio);
-				this.strainsEquivalent = this.strainsEquivalentPrev + deltastrainsEquivalent;
+				strainsEquivalent = strainsEquivalentPrev;
+				var yieldFunc = Math.Sqrt(3*J2) - hardeningFunc(strainsEquivalent);
+				hardeningModulus = CalculateHardeningGradient(strainsEquivalent);
+				while (Math.Abs(yieldFunc) >= 1e-6)
+				{
+					deltastrainsEquivalent += yieldFunc / (3 * shearModulus + hardeningModulus);
+					strainsEquivalent = strainsEquivalentPrev + deltastrainsEquivalent;
+					yieldFunc = Math.Sqrt(3 * J2) - 3 * shearModulus * deltastrainsEquivalent - hardeningFunc(strainsEquivalent);
+					hardeningModulus = CalculateHardeningGradient(strainsEquivalent);
+				}
 
 				for (int i = 0; i < incrementalStrains.Length; i++)
 				{
@@ -622,6 +621,8 @@ namespace MGroup.Constitutive.Structural.Continuum
 				strains[i] = strainsElastic[i] + strainsPlastic[i];
 			}
 		}
+
+		private double CalculateHardeningGradient(double strain_eq) => hardeningGrad = (hardeningFunc(strain_eq + 1e-8) - hardeningFunc(strain_eq)) / 1e-8;
 
 		/// <summary>
 		///   Calculates and returns the first stress invariant (I1).
